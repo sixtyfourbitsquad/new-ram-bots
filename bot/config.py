@@ -49,5 +49,6 @@ if not (1 <= _port <= 65535):
     raise ValueError(f"WEBHOOK_PORT must be 1-65535, got {_port}")
 WEBHOOK_PORT: int = _port
 
-BROADCAST_RATE_LIMIT: int = 25
+# Broadcast rate limit (messages per second)
+BROADCAST_RATE_LIMIT: int = int(os.getenv("BROADCAST_RATE_LIMIT", "10"))
 LOG_FILE: str = os.getenv("LOG_FILE", "bot.log")

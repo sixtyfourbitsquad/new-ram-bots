@@ -10,6 +10,7 @@ def admin_main_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🔍 Preview Welcome", callback_data="admin:preview_welcome")],
         [InlineKeyboardButton("📊 User Stats", callback_data="admin:stats")],
         [InlineKeyboardButton("📢 Broadcast", callback_data="admin:broadcast")],
+        [InlineKeyboardButton("📡 Broadcast Status", callback_data="broadcast:status")],
         [InlineKeyboardButton("⚙ Bot Configuration", callback_data="admin:config")],
         [InlineKeyboardButton("📜 View Logs", callback_data="admin:logs")],
     ])
