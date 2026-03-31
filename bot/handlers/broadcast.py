@@ -4,7 +4,7 @@ import time
 from telegram import Update
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
-from telegram.error import RetryAfter, Forbidden
+from telegram.error import RetryAfter, Forbidden, TimedOut, NetworkError
 
 from bot import config
 from bot.database import get_pool, log_broadcast
@@ -24,8 +24,24 @@ from bot.keyboards import confirm_broadcast_keyboard, back_to_admin_keyboard
 from bot.utils.logging import get_logger
 
 logger = get_logger(__name__)
-BROADCAST_RATE = config.BROADCAST_RATE_LIMIT
-SEM = asyncio.Semaphore(1)
+
+BROADCAST_RATE = config.BROADCAST_RATE_LIMIT  # 25/sec
+SEM = asyncio.Semaphore(1)  # one broadcast at a time
+TELEGRAM_RETRY_ATTEMPTS = 3
+
+
+async def _with_telegram_retry(call_factory, attempts: int = TELEGRAM_RETRY_ATTEMPTS):
+    """Retry transient Telegram API/network errors a few times."""
+    for attempt in range(1, attempts + 1):
+        try:
+            return await call_factory()
+        except RetryAfter as e:
+            await asyncio.sleep(float(e.retry_after) + 0.2)
+        except (TimedOut, NetworkError):
+            if attempt >= attempts:
+                raise
+            # Short exponential backoff for transient timeout/network blips.
+            await asyncio.sleep(min(2.0 * attempt, 5.0))
 
 
 def _is_admin(user_id: int) -> bool:
@@ -137,27 +153,24 @@ async def _send_one_broadcast(bot, user_id: int, payload: dict) -> bool:
         file_id = payload.get("file_id")
         caption = payload.get("caption") or text
         if t == "text":
-            await bot.send_message(user_id, text)
+            await _with_telegram_retry(lambda: bot.send_message(user_id, text))
         elif t == "photo":
-            await bot.send_photo(user_id, file_id, caption=caption or None)
+            await _with_telegram_retry(lambda: bot.send_photo(user_id, file_id, caption=caption or None))
         elif t == "video":
-            await bot.send_video(user_id, file_id, caption=caption or None)
+            await _with_telegram_retry(lambda: bot.send_video(user_id, file_id, caption=caption or None))
         elif t == "animation":
-            await bot.send_animation(user_id, file_id, caption=caption or None)
+            await _with_telegram_retry(lambda: bot.send_animation(user_id, file_id, caption=caption or None))
         elif t == "document":
-            await bot.send_document(user_id, file_id, caption=caption or None)
+            await _with_telegram_retry(lambda: bot.send_document(user_id, file_id, caption=caption or None))
         elif t == "audio":
-            await bot.send_audio(user_id, file_id, caption=caption or None)
+            await _with_telegram_retry(lambda: bot.send_audio(user_id, file_id, caption=caption or None))
         elif t == "voice":
-            await bot.send_voice(user_id, file_id, caption=caption or None)
+            await _with_telegram_retry(lambda: bot.send_voice(user_id, file_id, caption=caption or None))
         else:
-            await bot.send_message(user_id, text or "(no content)")
+            await _with_telegram_retry(lambda: bot.send_message(user_id, text or "(no content)"))
         return True
     except Forbidden:
         return False
-    except RetryAfter as e:
-        await asyncio.sleep(e.retry_after)
-        return await _send_one_broadcast(bot, user_id, payload)
     except Exception as e:
         logger.warning("Broadcast to %s failed: %s", user_id, e)
         return False

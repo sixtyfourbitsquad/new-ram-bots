@@ -13,6 +13,7 @@ if sys.platform != "win32":
 from telegram import Update
 from telegram.ext import Application, ContextTypes
 from telegram.request import HTTPXRequest
+from telegram.error import TimedOut, NetworkError
 
 from bot import config
 from bot.database import init_pool, close_pool, ensure_tables
@@ -52,10 +53,17 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
         try:
             user_id = update.effective_user.id if update.effective_user else 0
             if user_id in config.ADMIN_IDS:
-                detail = str(context.error) if context.error else "Unknown error"
-                if len(detail) > 3000:
-                    detail = detail[-3000:]
-                await update.effective_message.reply_text(f"⚠️ Error:\n{detail}\n\nCheck Admin → View Logs for details.")
+                if isinstance(context.error, (TimedOut, NetworkError)):
+                    await update.effective_message.reply_text(
+                        "⚠️ Telegram API timeout. Please retry once."
+                    )
+                else:
+                    detail = str(context.error) if context.error else "Unknown error"
+                    if len(detail) > 3000:
+                        detail = detail[-3000:]
+                    await update.effective_message.reply_text(
+                        f"⚠️ Error:\n{detail}\n\nCheck Admin → View Logs for details."
+                    )
             else:
                 await update.effective_message.reply_text("An error occurred. Please try again or contact the admin.")
         except Exception:
@@ -69,7 +77,14 @@ def main() -> None:
     except RuntimeError:
         asyncio.set_event_loop(asyncio.new_event_loop())
 
-    request = HTTPXRequest(connection_pool_size=8, read_timeout=30, write_timeout=30)
+    # HTTP client with timeouts
+    request = HTTPXRequest(
+        connection_pool_size=16,
+        connect_timeout=20,
+        read_timeout=60,
+        write_timeout=60,
+        pool_timeout=20,
+    )
     app = (
         Application.builder()
         .token(config.BOT_TOKEN)
