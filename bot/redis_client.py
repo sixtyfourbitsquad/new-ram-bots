@@ -56,6 +56,15 @@ async def pop_broadcast_task() -> Optional[dict]:
     return json.loads(raw)
 
 
+async def clear_broadcast_queue() -> int:
+    """Remove all queued broadcast jobs and return removed count."""
+    r = get_redis()
+    queued = int(await r.llen(BROADCAST_QUEUE))
+    if queued > 0:
+        await r.delete(BROADCAST_QUEUE)
+    return queued
+
+
 async def set_broadcast_status(
     state: str,
     total: int = 0,

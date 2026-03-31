@@ -4,7 +4,7 @@ import time
 from telegram import Update
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
-from telegram.error import RetryAfter, Forbidden, TimedOut, NetworkError
+from telegram.error import RetryAfter, Forbidden, TimedOut, NetworkError, BadRequest
 
 from bot import config
 from bot.database import get_pool, log_broadcast
@@ -13,6 +13,7 @@ from bot.redis_client import (
     get_pending_broadcast,
     clear_pending_broadcast,
     push_broadcast_task,
+    clear_broadcast_queue,
     get_broadcast_queue_length,
     get_broadcast_status,
     set_broadcast_status,
@@ -62,11 +63,42 @@ async def broadcast_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if data == "broadcast:status":
         status = await get_broadcast_status()
         queue_len = await get_broadcast_queue_length()
-        await query.edit_message_text(
-            _format_broadcast_status(status, queue_len),
-            reply_markup=_broadcast_status_keyboard(),
-            parse_mode="Markdown",
-        )
+        await _safe_edit_status_message(query, status, queue_len)
+        return
+
+    if data == "broadcast:clear_pending":
+        status = await get_broadcast_status()
+        queue_len = await get_broadcast_queue_length()
+        await _safe_edit_status_message(query, status, queue_len, confirm_clear=True)
+        return
+
+    if data == "broadcast:clear_pending_confirm":
+        removed = await clear_broadcast_queue()
+        status = await get_broadcast_status()
+        state = status.get("state", "idle")
+        if state == "running":
+            await set_broadcast_status(
+                state="running",
+                total=_to_int(status.get("total")),
+                processed=_to_int(status.get("processed")),
+                success=_to_int(status.get("success")),
+                failed=_to_int(status.get("failed")),
+                last_error=f"Pending queue cleared by admin ({removed} removed).",
+            )
+        else:
+            await set_broadcast_status(
+                state="idle",
+                total=0,
+                processed=0,
+                success=0,
+                failed=0,
+                last_error=f"Pending queue cleared by admin ({removed} removed).",
+            )
+        refreshed = await get_broadcast_status()
+        queue_len = await get_broadcast_queue_length()
+        await _safe_edit_status_message(query, refreshed, queue_len)
+        await query.answer(f"Cleared {removed} pending broadcast job(s).", show_alert=True)
+        logger.info("Admin %s cleared %s pending broadcast jobs", user_id, removed)
         return
 
     if data == "broadcast:cancel":
@@ -184,6 +216,33 @@ def _progress_bar(processed: int, total: int, width: int = 20) -> str:
     return "[" + ("#" * filled) + ("-" * (width - filled)) + f"] {int(ratio * 100)}%"
 
 
+def _to_int(value) -> int:
+    try:
+        return int(value or 0)
+    except Exception:
+        return 0
+
+
+async def _safe_edit_status_message(
+    query,
+    status: dict,
+    queue_len: int,
+    confirm_clear: bool = False,
+) -> None:
+    try:
+        await query.edit_message_text(
+            _format_broadcast_status(status, queue_len),
+            reply_markup=_broadcast_status_keyboard(confirm_clear=confirm_clear),
+            parse_mode="Markdown",
+        )
+    except BadRequest as e:
+        # Telegram raises this when refreshed content is identical.
+        if "message is not modified" in str(e).lower():
+            await query.answer("Status unchanged.", show_alert=False)
+            return
+        raise
+
+
 def _format_broadcast_status(status: dict, queue_len: int) -> str:
     state = status.get("state", "idle")
     total = int(status.get("total", "0") or 0)
@@ -215,10 +274,19 @@ def _format_broadcast_status(status: dict, queue_len: int) -> str:
     return "\n".join(lines)
 
 
-def _broadcast_status_keyboard() -> InlineKeyboardMarkup:
+def _broadcast_status_keyboard(confirm_clear: bool = False) -> InlineKeyboardMarkup:
+    if confirm_clear:
+        return InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("✅ Confirm Clear Pending Queue", callback_data="broadcast:clear_pending_confirm")],
+                [InlineKeyboardButton("↩️ Keep Queue", callback_data="broadcast:status")],
+                [InlineKeyboardButton("◀️ Back to Admin", callback_data="admin:main")],
+            ]
+        )
     return InlineKeyboardMarkup(
         [
             [InlineKeyboardButton("🔄 Refresh Status", callback_data="broadcast:status")],
+            [InlineKeyboardButton("🧹 Clear Pending Queue", callback_data="broadcast:clear_pending")],
             [InlineKeyboardButton("◀️ Back to Admin", callback_data="admin:main")],
         ]
     )
