@@ -15,6 +15,7 @@ BROADCAST_QUEUE = "broadcast:queue"
 BROADCAST_PENDING_PAYLOAD = "broadcast:pending"  # temp storage for admin's draft
 BROADCAST_STATUS_KEY = "broadcast:status"
 ADMIN_STATE_PREFIX = "admin:state:"
+AUTO_ACCEPT_KEY = "channel:auto_accept_enabled"
 
 
 async def init_redis() -> redis.Redis:
@@ -145,3 +146,24 @@ async def get_admin_state(admin_id: int) -> Optional[str]:
 async def clear_admin_state(admin_id: int) -> None:
     r = get_redis()
     await r.delete(f"{ADMIN_STATE_PREFIX}{admin_id}")
+
+
+async def get_auto_accept_enabled() -> bool:
+    """Return whether channel join requests should be auto-approved."""
+    r = get_redis()
+    value = await r.get(AUTO_ACCEPT_KEY)
+    return value == "1"
+
+
+async def set_auto_accept_enabled(enabled: bool) -> None:
+    """Persist channel auto-accept setting."""
+    r = get_redis()
+    await r.set(AUTO_ACCEPT_KEY, "1" if enabled else "0")
+
+
+async def toggle_auto_accept_enabled() -> bool:
+    """Toggle channel auto-accept and return the new state."""
+    enabled = await get_auto_accept_enabled()
+    new_value = not enabled
+    await set_auto_accept_enabled(new_value)
+    return new_value
