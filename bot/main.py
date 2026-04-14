@@ -20,6 +20,7 @@ from bot.database import init_pool, close_pool, ensure_tables
 from bot.redis_client import init_redis, close_redis
 from bot.handlers import register_handlers
 from bot.handlers.broadcast import broadcast_worker
+from bot.handlers.retention import retention_worker
 from bot.utils.logging import setup_logging, get_logger
 
 logger = get_logger(__name__)
@@ -44,7 +45,8 @@ async def post_init(app: Application) -> None:
     await ensure_tables()
     app.bot_data["start_time"] = time.time()
     asyncio.create_task(broadcast_worker(app.bot))
-    logger.info("Bot initialized; pool, redis, broadcast worker started.")
+    asyncio.create_task(retention_worker(app.bot))
+    logger.info("Bot initialized; pool, redis, broadcast and retention workers started.")
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:

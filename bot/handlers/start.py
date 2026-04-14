@@ -6,6 +6,7 @@ from bot import config
 from bot.database import upsert_user
 from bot.keyboards import admin_main_keyboard
 from bot.handlers.admin import send_full_welcome
+from bot.handlers.retention import schedule_retention_for_user
 from bot.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -35,6 +36,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     else:
         name = user.first_name or "User"
         await send_full_welcome(context, user_id, name=name)
+        await schedule_retention_for_user(user_id, name)
 
 
 async def _callback_update_seen(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

@@ -6,6 +6,7 @@ from telegram.error import Forbidden
 from bot import config
 from bot.database import increment_join_requests, get_channel_id
 from bot.handlers.admin import send_full_welcome
+from bot.handlers.retention import schedule_retention_for_user
 from bot.redis_client import get_auto_accept_enabled
 from bot.utils.logging import get_logger
 
@@ -32,6 +33,7 @@ async def join_request_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     logger.info("Join request from user_id=%s", user_id)
     try:
         await send_full_welcome(context, user_id, name=name)
+        await schedule_retention_for_user(user_id, name)
     except Forbidden:
         logger.info("User %s has not started bot or blocked bot; skip sending", user_id)
     except Exception as e:

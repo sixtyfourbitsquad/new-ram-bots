@@ -2,6 +2,7 @@
 from datetime import datetime, timedelta
 from typing import List, Optional
 
+from bot import config
 from bot.database.pool import get_pool
 
 INIT_SQL = """
@@ -47,6 +48,23 @@ ALTER TABLE welcome_config ADD COLUMN IF NOT EXISTS channel_id BIGINT;
 
 ALTER TABLE welcome_messages ADD COLUMN IF NOT EXISTS copy_from_chat_id BIGINT;
 ALTER TABLE welcome_messages ADD COLUMN IF NOT EXISTS copy_from_message_id INTEGER;
+
+CREATE TABLE IF NOT EXISTS retention_drip_jobs (
+    id SERIAL PRIMARY KEY,
+    user_id BIGINT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+    stage_key VARCHAR(20) NOT NULL,
+    message_text TEXT NOT NULL,
+    send_at TIMESTAMPTZ NOT NULL,
+    status VARCHAR(20) NOT NULL DEFAULT 'pending',
+    attempts INTEGER NOT NULL DEFAULT 0,
+    max_attempts INTEGER NOT NULL DEFAULT 3,
+    last_error TEXT,
+    sent_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(user_id, stage_key)
+);
+CREATE INDEX IF NOT EXISTS idx_retention_drip_jobs_due ON retention_drip_jobs(status, send_at);
 """
 
 
@@ -173,3 +191,168 @@ async def log_broadcast(msg_type: str, content: str, success_count: int, failed_
             "INSERT INTO broadcast_history (type, content, success_count, failed_count) VALUES ($1, $2, $3, $4)",
             msg_type, content[:5000] if content else "", success_count, failed_count,
         )
+
+
+def _retention_stages_for(name: str) -> list[tuple[str, int, str]]:
+    safe_name = name or "User"
+    stages = [
+        ("1h", 3600, config.RETENTION_1H_MESSAGE),
+        ("1d", 86400, config.RETENTION_1D_MESSAGE),
+        ("3d", 259200, config.RETENTION_3D_MESSAGE),
+    ]
+    output: list[tuple[str, int, str]] = []
+    for key, delay_sec, template in stages:
+        text = (template or "").strip()
+        if not text:
+            continue
+        output.append((key, delay_sec, text.replace("{name}", safe_name)))
+    return output
+
+
+async def schedule_retention_drip_jobs(user_id: int, name: str) -> int:
+    """Create +1h/+1d/+3d drip jobs once per user."""
+    if not config.RETENTION_ENABLED:
+        return 0
+    stages = _retention_stages_for(name)
+    if not stages:
+        return 0
+    inserted = 0
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        for stage_key, delay_sec, message_text in stages:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO retention_drip_jobs (user_id, stage_key, message_text, send_at)
+                VALUES ($1, $2, $3, NOW() + ($4 * INTERVAL '1 second'))
+                ON CONFLICT (user_id, stage_key) DO NOTHING
+                RETURNING id
+                """,
+                user_id,
+                stage_key,
+                message_text,
+                delay_sec,
+            )
+            if row:
+                inserted += 1
+    return inserted
+
+
+async def reclaim_stale_retention_jobs() -> int:
+    """Return processing jobs back to pending after worker crashes/restarts."""
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        return int(
+            await conn.fetchval(
+                """
+                WITH moved AS (
+                    UPDATE retention_drip_jobs
+                    SET status = 'pending',
+                        updated_at = NOW(),
+                        last_error = COALESCE(last_error, '') || ' [Recovered stale processing job]'
+                    WHERE status = 'processing'
+                      AND updated_at < NOW() - INTERVAL '10 minutes'
+                    RETURNING 1
+                )
+                SELECT COUNT(*) FROM moved
+                """
+            )
+            or 0
+        )
+
+
+async def claim_due_retention_jobs(limit: int) -> List[dict]:
+    """Atomically claim due jobs to avoid double-sending."""
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            WITH due AS (
+                SELECT id
+                FROM retention_drip_jobs
+                WHERE status = 'pending'
+                  AND send_at <= NOW()
+                ORDER BY send_at, id
+                LIMIT $1
+                FOR UPDATE SKIP LOCKED
+            )
+            UPDATE retention_drip_jobs AS j
+            SET status = 'processing',
+                attempts = j.attempts + 1,
+                updated_at = NOW()
+            FROM due
+            WHERE j.id = due.id
+            RETURNING
+                j.id,
+                j.user_id,
+                j.stage_key,
+                j.message_text,
+                j.attempts,
+                j.max_attempts
+            """,
+            max(1, limit),
+        )
+        return [dict(r) for r in rows]
+
+
+async def mark_retention_job_sent(job_id: int) -> None:
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE retention_drip_jobs
+            SET status = 'sent',
+                sent_at = NOW(),
+                updated_at = NOW(),
+                last_error = NULL
+            WHERE id = $1
+            """,
+            job_id,
+        )
+
+
+async def mark_retention_job_cancelled(job_id: int, reason: str) -> None:
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE retention_drip_jobs
+            SET status = 'cancelled',
+                updated_at = NOW(),
+                last_error = $2
+            WHERE id = $1
+            """,
+            job_id,
+            (reason or "")[:500],
+        )
+
+
+async def mark_retention_job_failed(job_id: int, attempts: int, max_attempts: int, error_text: str) -> None:
+    pool = get_pool()
+    error_text = (error_text or "Unknown error")[:500]
+    async with pool.acquire() as conn:
+        if attempts >= max_attempts:
+            await conn.execute(
+                """
+                UPDATE retention_drip_jobs
+                SET status = 'failed',
+                    updated_at = NOW(),
+                    last_error = $2
+                WHERE id = $1
+                """,
+                job_id,
+                error_text,
+            )
+        else:
+            await conn.execute(
+                """
+                UPDATE retention_drip_jobs
+                SET status = 'pending',
+                    send_at = NOW() + ($2 * INTERVAL '1 second'),
+                    updated_at = NOW(),
+                    last_error = $3
+                WHERE id = $1
+                """,
+                job_id,
+                max(1, config.RETENTION_RETRY_DELAY_SEC),
+                error_text,
+            )
